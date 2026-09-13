@@ -17,38 +17,56 @@ app.get('/read', (req, res) => {
   const safeName = path.basename(file);
   const filePath = path.join(SAFE_DIR, safeName);
 
-  fs.stat(filePath, (statErr, stats) => {
-    if (statErr) {
-      if (statErr.code === 'ENOENT') {
+  fs.realpath(filePath, (realErr, resolvedPath) => {
+    if (realErr) {
+      if (realErr.code === 'ENOENT') {
         return res.status(404).json({ error: 'File not found' });
       }
       return res.status(500).json({ error: 'Failed to read file' });
     }
 
-    if (!stats.isFile()) {
+    // Resolve SAFE_DIR too (in case it itself contains symlinks) and make sure
+    // the fully-resolved target still lives inside it. This blocks symlinks
+    // placed inside SAFE_DIR that point outside of it.
+    const resolvedSafeDir = fs.realpathSync(SAFE_DIR);
+    const relative = path.relative(resolvedSafeDir, resolvedPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) {
       return res.status(404).json({ error: 'File not found' });
     }
 
-    if (stats.size > MAX_READ_BYTES) {
-      return res.status(413).json({ error: 'File too large to read' });
-    }
-
-    res.type('text/plain; charset=utf-8');
-
-    const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
-
-    stream.on('error', (err) => {
-      if (!res.headersSent) {
-        if (err.code === 'ENOENT') {
+    fs.stat(resolvedPath, (statErr, stats) => {
+      if (statErr) {
+        if (statErr.code === 'ENOENT') {
           return res.status(404).json({ error: 'File not found' });
         }
         return res.status(500).json({ error: 'Failed to read file' });
       }
-      res.destroy();
-    });
 
-    // pipe() respects backpressure automatically
-    stream.pipe(res);
+      if (!stats.isFile()) {
+        return res.status(404).json({ error: 'File not found' });
+      }
+
+      if (stats.size > MAX_READ_BYTES) {
+        return res.status(413).json({ error: 'File too large to read' });
+      }
+
+      res.type('text/plain; charset=utf-8');
+
+      const stream = fs.createReadStream(resolvedPath, { encoding: 'utf8' });
+
+      stream.on('error', (err) => {
+        if (!res.headersSent) {
+          if (err.code === 'ENOENT') {
+            return res.status(404).json({ error: 'File not found' });
+          }
+          return res.status(500).json({ error: 'Failed to read file' });
+        }
+        res.destroy();
+      });
+
+      // pipe() respects backpressure automatically
+      stream.pipe(res);
+    });
   });
 });
 
