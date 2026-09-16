@@ -75,13 +75,8 @@ app.get('/read', async (req, res) => {
   // itself fails (ELOOP) instead of following it outside SAFE_DIR. Every
   // check from here on (fstat, size, streaming) operates on this single file
   // descriptor, so there is no further window for the target to be swapped
-  // out from under us.
-  //
-  // O_NOFOLLOW is undefined on Windows, so READ_OPEN_FLAGS silently omits it
-  // there and the open alone can't be trusted to reject a symlink swapped in
-  // after the realpath check above. To cover that platform, re-verify with
-  // lstat + realpath on the path right after opening, before any data is
-  // read from the fd.
+  // out from under us. The post-open realpath check below adds a further,
+  // platform-independent guard on top of this.
   fs.open(filePath, READ_OPEN_FLAGS, async (openErr, fd) => {
     if (openErr) {
       return sendFsError(res, openErr);
@@ -89,18 +84,24 @@ app.get('/read', async (req, res) => {
 
     const closeFd = () => fs.close(fd, () => {});
 
-    if (!HAS_O_NOFOLLOW) {
-      try {
-        const lstatResult = await fs.promises.lstat(filePath);
-        const postOpenRealPath = await fs.promises.realpath(filePath);
-        if (lstatResult.isSymbolicLink() || postOpenRealPath !== resolvedPath) {
-          closeFd();
-          return res.status(404).json({ error: 'File not found' });
-        }
-      } catch (err) {
+    // Post-open containment re-check: re-resolve filePath and confirm it
+    // still lands inside resolvedSafeDir before any data is read from fd.
+    // This runs unconditionally (not just on platforms lacking O_NOFOLLOW)
+    // because O_NOFOLLOW only guards the final path component — it can't
+    // catch a directory swap higher up the path that races between the
+    // up-front realpath check and this open completing.
+    try {
+      const postOpenRealPath = await fs.promises.realpath(filePath);
+      const relative = path.relative(resolvedSafeDir, postOpenRealPath);
+      const escaped = relative === '' || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative);
+      const symlinked = !HAS_O_NOFOLLOW && (await fs.promises.lstat(filePath)).isSymbolicLink();
+      if (escaped || symlinked) {
         closeFd();
-        return sendFsError(res, err);
+        return res.status(403).json({ error: 'Permission denied' });
       }
+    } catch (err) {
+      closeFd();
+      return sendFsError(res, err);
     }
 
     fs.fstat(fd, (statErr, stats) => {
