@@ -7,6 +7,11 @@ const app = express();
 const SAFE_DIR = path.join(__dirname, 'files');
 const MAX_READ_BYTES = 5 * 1024 * 1024; // 5 MB cap on /read responses
 
+// O_NOFOLLOW isn't defined on Windows, so the open-time symlink guard below
+// falls back to an explicit post-open lstat/realpath check on that platform.
+const HAS_O_NOFOLLOW = typeof fs.constants.O_NOFOLLOW === 'number';
+const READ_OPEN_FLAGS = fs.constants.O_RDONLY | (HAS_O_NOFOLLOW ? fs.constants.O_NOFOLLOW : 0);
+
 // Maps a filesystem error (from realpath/open/fstat/streaming) to the HTTP
 // status code we should return for it. Kept in one place so every phase of
 // /read (the up-front check, the open, and the stream itself) answers the
@@ -34,7 +39,7 @@ function sendFsError(res, err) {
 }
 
 // Target 1: Arbitrary File Read
-app.get('/read', (req, res) => {
+app.get('/read', async (req, res) => {
   const file = req.query.file;
   if (!file) {
     return res.status(400).json({ error: 'Missing required query parameter: file' });
@@ -49,11 +54,14 @@ app.get('/read', (req, res) => {
   // best-effort check only — it can't close the gap between "we checked" and
   // "we open the file" (a TOCTOU race, e.g. the entry is swapped for a
   // symlink right after this check runs), so it is backed up by an atomic,
-  // race-free guard at open time below.
+  // race-free guard at open time below. Done with the async realpath API
+  // (not realpathSync) so a slow/contended filesystem lookup can't block the
+  // event loop while other requests are waiting.
   let resolvedSafeDir;
+  let resolvedPath;
   try {
-    resolvedSafeDir = fs.realpathSync(SAFE_DIR);
-    const resolvedPath = fs.realpathSync(filePath);
+    resolvedSafeDir = await fs.promises.realpath(SAFE_DIR);
+    resolvedPath = await fs.promises.realpath(filePath);
     const relative = path.relative(resolvedSafeDir, resolvedPath);
     if (relative === '' || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
       return res.status(404).json({ error: 'File not found' });
@@ -62,17 +70,38 @@ app.get('/read', (req, res) => {
     return sendFsError(res, err);
   }
 
-  // Open with O_NOFOLLOW: if the final path component is, or was just raced
-  // into being, a symlink, the open call itself fails (ELOOP) instead of
-  // following it outside SAFE_DIR. Every check from here on (fstat, size,
-  // streaming) operates on this single file descriptor, so there is no
-  // further window for the target to be swapped out from under us.
-  fs.open(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW, (openErr, fd) => {
+  // Open with O_NOFOLLOW where the platform supports it: if the final path
+  // component is, or was just raced into being, a symlink, the open call
+  // itself fails (ELOOP) instead of following it outside SAFE_DIR. Every
+  // check from here on (fstat, size, streaming) operates on this single file
+  // descriptor, so there is no further window for the target to be swapped
+  // out from under us.
+  //
+  // O_NOFOLLOW is undefined on Windows, so READ_OPEN_FLAGS silently omits it
+  // there and the open alone can't be trusted to reject a symlink swapped in
+  // after the realpath check above. To cover that platform, re-verify with
+  // lstat + realpath on the path right after opening, before any data is
+  // read from the fd.
+  fs.open(filePath, READ_OPEN_FLAGS, async (openErr, fd) => {
     if (openErr) {
       return sendFsError(res, openErr);
     }
 
     const closeFd = () => fs.close(fd, () => {});
+
+    if (!HAS_O_NOFOLLOW) {
+      try {
+        const lstatResult = await fs.promises.lstat(filePath);
+        const postOpenRealPath = await fs.promises.realpath(filePath);
+        if (lstatResult.isSymbolicLink() || postOpenRealPath !== resolvedPath) {
+          closeFd();
+          return res.status(404).json({ error: 'File not found' });
+        }
+      } catch (err) {
+        closeFd();
+        return sendFsError(res, err);
+      }
+    }
 
     fs.fstat(fd, (statErr, stats) => {
       if (statErr) {
@@ -106,12 +135,19 @@ app.get('/read', (req, res) => {
         if (!err) {
           return;
         }
-        if (!res.headersSent) {
-          return sendFsError(res, err);
+        // Only safe to write a status/JSON body if nothing has reached the
+        // client yet and the response socket is still alive. If headers were
+        // already flushed, or the client/response was already torn down
+        // (e.g. the connection dropped mid-request), writing to res here
+        // would throw or attempt to reset an already-closed connection —
+        // just make sure it's torn down.
+        if (res.headersSent || res.destroyed || res.writableEnded) {
+          if (!res.destroyed) {
+            res.destroy();
+          }
+          return;
         }
-        // Headers were already flushed to the client, so the status code
-        // can no longer change; just make sure the connection is torn down.
-        res.destroy();
+        sendFsError(res, err);
       });
     });
   });
